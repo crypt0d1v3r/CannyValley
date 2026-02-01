@@ -234,17 +234,6 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
-## 📚 Documentation
-
-Full documentation is available at [docs/](docs/) or online at [cannyvalley.readthedocs.io](https://cannyvalley.readthedocs.io).
-
-Topics covered:
-- Detailed API reference
-- Model architecture deep-dive
-- Training best practices
-- Deployment guides
-- Performance optimization
-
 ## 🔒 Ethical Considerations
 
 CannyValley is designed to promote transparency and authenticity in digital media. Please use this tool responsibly:
@@ -268,13 +257,13 @@ CannyValley is designed to promote transparency and authenticity in digital medi
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - Research inspired by recent advances in deepfake detection
 - Built with PyTorch and TensorFlow
 - Special thanks to the open-source AI community
 
-## 📞 Contact
+## Contact
 
 - **Project Maintainer**: [Your Name](mailto:your.email@example.com)
 - **Issues**: [GitHub Issues](https://github.com/yourusername/CannyValley/issues)
