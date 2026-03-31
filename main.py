@@ -14,8 +14,8 @@ from PIL import Image
 app = FastAPI(title="Fake vs Real Image Classifier API")
 
 # Setup directories
-MODELS_DIR = "models"
-DATASETS_DIR = "datasets"
+MODELS_DIR = os.path.abspath("models")
+DATASETS_DIR = os.path.abspath("datasets")
 os.makedirs(MODELS_DIR, exist_ok=True)
 os.makedirs(DATASETS_DIR, exist_ok=True)
 
@@ -91,6 +91,7 @@ async def train_model(request: TrainRequest):
     try:
         if request.dataset_source == "birdy654/cifake-real-and-ai-generated-synthetic-images":
             dataset_path = kagglehub.dataset_download("birdy654/cifake-real-and-ai-generated-synthetic-images")
+            dataset_path = os.path.abspath(dataset_path)
         elif request.dataset_source == "Hemg/AI-vs-Real-images":
             dataset_path = load_dataset("Hemg/AI-vs-Real-images")
             raise HTTPException(status_code=501, detail="HuggingFace dataset custom export mapping not supported yet.")
@@ -104,11 +105,22 @@ async def train_model(request: TrainRequest):
     except Exception as e:
          raise HTTPException(status_code=500, detail=f"Failed to load dataset: {str(e)}")
 
-    train_dir = os.path.join(dataset_path, 'train')
-    test_dir = os.path.join(dataset_path , 'test')
-    
-    if not os.path.exists(train_dir) or not os.path.exists(test_dir):
-        raise HTTPException(status_code=500, detail=f"Dataset directories not found at {dataset_path}")
+    # Walk the downloaded path to find the actual train/test directories
+    # (KaggleHub may nest files under a version subfolder)
+    train_dir = None
+    test_dir = None
+    for root, dirs, _ in os.walk(dataset_path):
+        if 'train' in dirs:
+            train_dir = os.path.join(root, 'train')
+        if 'test' in dirs:
+            test_dir = os.path.join(root, 'test')
+        if train_dir and test_dir:
+            break
+
+    if not train_dir or not os.path.exists(train_dir):
+        raise HTTPException(status_code=500, detail=f"'train' directory not found under dataset path: {dataset_path}")
+    if not test_dir or not os.path.exists(test_dir):
+        raise HTTPException(status_code=500, detail=f"'test' directory not found under dataset path: {dataset_path}")
 
     train_dataset = vision_datasets.ImageFolder(root=train_dir, transform=data_transforms)
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
