@@ -5,11 +5,12 @@ from pydantic import BaseModel
 import kagglehub
 from datasets import load_dataset
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import torchvision.datasets as vision_datasets
 import torch
 import numpy as np
 from PIL import Image
+import matplotlib.pyplot as plt
 
 app = FastAPI(title="Fake vs Real Image Classifier API")
 
@@ -60,6 +61,76 @@ data_transforms = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
+class CNN_GMP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+        # 1. Feature Extractor (The "Sliding Window")
+        # This part doesn't care about input dimensions.
+        self.features = nn.Sequential(
+            nn.Conv2d(in_channels=3, out_channels=32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2)
+        )
+        
+        # 2. Global Max Pooling
+        # This forces ANY spatial dimension down to a 1x1 grid.
+        # If the input to this layer is (Batch, 64, 100, 100), it becomes (Batch, 64, 1, 1).
+        self.global_max_pool = nn.AdaptiveMaxPool2d((1, 1))
+
+        # 3. Classification Head
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            # Notice the input is now exactly 64 (the number of channels), 
+            # NOT 64 * 28 * 28.
+            nn.Linear(64, 512), 
+            nn.ReLU(),
+            nn.Linear(512, 2)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.global_max_pool(x)
+        x = self.classifier(x)
+        return x
+    
+
+# Data transformations for arbitrary-sized inputs
+data_transforms = transforms.Compose([
+    # REMOVED: transforms.Resize(256)
+    # REMOVED: transforms.CenterCrop(224)
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+def kfold_split(data, k=5):
+    """Creates k-fold cross-validation splits for the given data.
+    
+    Args:
+        data: PyTorch Dataset to split
+        k: Number of folds (default=5)
+    
+    Yields:
+        Tuples of (train_subset, val_subset) for each fold
+    """
+    from sklearn.model_selection import KFold
+    
+    kfold = KFold(n_splits=k, shuffle=True, random_state=42)
+    indices = np.arange(len(data))
+    np.random.shuffle(indices)
+    
+    for train_idx, val_idx in kfold.split(indices):
+        train_subset = Subset(data, train_idx)
+        val_subset = Subset(data, val_idx)
+        yield train_subset, val_subset
+
+
 class TrainRequest(BaseModel):
     dataset_source: str
     model_name: str
@@ -105,13 +176,13 @@ async def train_model(request: TrainRequest):
          raise HTTPException(status_code=500, detail=f"Failed to load dataset: {str(e)}")
 
     train_dir = os.path.join(dataset_path, 'train')
+    
     test_dir = os.path.join(dataset_path , 'test')
     
     if not os.path.exists(train_dir) or not os.path.exists(test_dir):
         raise HTTPException(status_code=500, detail=f"Dataset directories not found at {dataset_path}")
 
     train_dataset = vision_datasets.ImageFolder(root=train_dir, transform=data_transforms)
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     class_names = train_dataset.classes
     
     # 2. Model Initialization
@@ -120,21 +191,53 @@ async def train_model(request: TrainRequest):
     weight_decay = 0.01
     optimizer = torch.optim.Adam(model.parameters(), lr=request.learning_rate, weight_decay=weight_decay)
 
-    # 3. Training Loop
-    model.train()
-    print(f"Starting training for {request.num_epochs} epochs with {len(train_loader)} batches per epoch...")
-    for epoch in range(request.num_epochs):
-        for i, (images, labels) in enumerate(train_loader):
-            images = images.to(device)
-            labels = labels.to(device)
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            if i % 10 == 0:
-                print(f"Epoch [{epoch+1}/{request.num_epochs}], Batch [{i}/{len(train_loader)}], Loss: {loss.item():.4f}")
-            
+    # 3. K-Fold Cross-Validation Training Loop
+    for fold_num, (train_subset, val_subset) in enumerate(kfold_split(train_dataset, k=5)):
+        print(f"\n--- Fold {fold_num + 1}/5 ---")
+        train_loader = DataLoader(train_subset, batch_size=32, shuffle=True)
+        val_loader = DataLoader(val_subset, batch_size=32, shuffle=False)
+        
+        print(f"Starting training for {request.num_epochs} epochs with {len(train_loader)} batches per epoch...")
+        train_errors = []
+        val_errors = []
+        for epoch in range(request.num_epochs):
+            model.train()
+            for i, (images, labels) in enumerate(train_loader):
+                images = images.to(device)
+                labels = labels.to(device)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                if i % 10 == 0:
+                    print(f"Epoch [{epoch+1}/{request.num_epochs}], Batch [{i}/{len(train_loader)}], Loss: {loss.item():.4f}")
+
+            model.eval()
+            with torch.no_grad():
+                train_correct = sum(
+                    (model(imgs.to(device)).argmax(1) == lbls.to(device)).sum().item()
+                    for imgs, lbls in train_loader
+                )
+                val_correct = sum(
+                    (model(imgs.to(device)).argmax(1) == lbls.to(device)).sum().item()
+                    for imgs, lbls in val_loader
+                )
+            train_errors.append(1 - train_correct / len(train_subset))
+            val_errors.append(1 - val_correct / len(val_subset))
+
+        plt.figure()
+        plt.plot(range(1, request.num_epochs + 1), train_errors, label='Train Error')
+        plt.plot(range(1, request.num_epochs + 1), val_errors, label='Val Error')
+        plt.xlabel('Epoch')
+        plt.ylabel('Misclassification Error')
+        plt.title(f'Fold {fold_num + 1} - Learning Curve')
+        plt.legend()
+        plot_path = os.path.join(MODELS_DIR, f"{request.model_name}_fold{fold_num + 1}_curve.png")
+        plt.savefig(plot_path)
+        plt.close()
+        print(f"Saved learning curve to {plot_path}")
+
     # Save the model
     model_path = os.path.join(MODELS_DIR, f"{request.model_name}.pth")
     torch.save({
