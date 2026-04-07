@@ -1,3 +1,5 @@
+import argparse
+import asyncio
 import os
 import io
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
@@ -8,6 +10,7 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset
 import torchvision.datasets as vision_datasets
 import torch
+import torch.nn as nn
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -31,35 +34,35 @@ AVAILABLE_DATASETS = [
 ]
 
 # Model Definition
-class CNN(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.model = torch.nn.Sequential(
-            torch.nn.Conv2d(in_channels=3, out_channels=32, kernel_size=3, padding=1),
-            torch.nn.ReLU(),
-            torch.nn.MaxPool2d(kernel_size=2),
-            torch.nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1),
-            torch.nn.ReLU(),
-            torch.nn.MaxPool2d(kernel_size=2),
-            torch.nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, padding=1),
-            torch.nn.ReLU(),
-            torch.nn.MaxPool2d(kernel_size=2),
-            torch.nn.Flatten(),
-            torch.nn.Linear(64 * 28 * 28, 512),
-            torch.nn.ReLU(),
-            torch.nn.Linear(512, 2)
-        )
+# class CNN(torch.nn.Module):
+#     def __init__(self):
+#         super().__init__()
+#         self.model = torch.nn.Sequential(
+#             torch.nn.Conv2d(in_channels=3, out_channels=32, kernel_size=3, padding=1),
+#             torch.nn.ReLU(),
+#             torch.nn.MaxPool2d(kernel_size=2),
+#             torch.nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1),
+#             torch.nn.ReLU(),
+#             torch.nn.MaxPool2d(kernel_size=2),
+#             torch.nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, padding=1),
+#             torch.nn.ReLU(),
+#             torch.nn.MaxPool2d(kernel_size=2),
+#             torch.nn.Flatten(),
+#             torch.nn.Linear(64 * 28 * 28, 512),
+#             torch.nn.ReLU(),
+#             torch.nn.Linear(512, 2)
+#         )
 
-    def forward(self, x):
-        return self.model(x)
+#     def forward(self, x):
+#         return self.model(x)
 
-# Data transformations
-data_transforms = transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+# # Data transformations
+# data_transforms = transforms.Compose([
+#     transforms.Resize(256),
+#     transforms.CenterCrop(224),
+#     transforms.ToTensor(),
+#     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+# ])
 
 class CNN_GMP(nn.Module):
     def __init__(self):
@@ -185,33 +188,55 @@ async def train_model(request: TrainRequest):
     train_dataset = vision_datasets.ImageFolder(root=train_dir, transform=data_transforms)
     class_names = train_dataset.classes
     
-    # 2. Model Initialization
-    model = CNN().to(device)
+    # 2. Model & Training Configuration
+    k = 5
     criterion = torch.nn.CrossEntropyLoss()
     weight_decay = 0.01
-    optimizer = torch.optim.Adam(model.parameters(), lr=request.learning_rate, weight_decay=weight_decay)
+    accumulation_steps = 32
 
     # 3. K-Fold Cross-Validation Training Loop
-    for fold_num, (train_subset, val_subset) in enumerate(kfold_split(train_dataset, k=5)):
-        print(f"\n--- Fold {fold_num + 1}/5 ---")
-        train_loader = DataLoader(train_subset, batch_size=32, shuffle=True)
-        val_loader = DataLoader(val_subset, batch_size=32, shuffle=False)
-        
-        print(f"Starting training for {request.num_epochs} epochs with {len(train_loader)} batches per epoch...")
-        train_errors = []
-        val_errors = []
+    all_train_errors = np.zeros((k, request.num_epochs))
+    all_val_errors = np.zeros((k, request.num_epochs))
+    best_val_error = float('inf')
+    best_model_state = None
+    best_fold = -1
+    best_epoch = -1
+
+    for fold_num, (train_subset, val_subset) in enumerate(kfold_split(train_dataset, k=k)):
+        print(f"\n--- Fold {fold_num + 1}/{k} ---")
+
+        # Reinitialize model and optimizer for each fold
+        model = CNN_GMP().to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=request.learning_rate, weight_decay=weight_decay)
+
+        train_loader = DataLoader(train_subset, batch_size=1, shuffle=True)
+        val_loader = DataLoader(val_subset, batch_size=1, shuffle=False)
+
+        print(f"Starting training for {request.num_epochs} epochs ({len(train_loader)} images, accumulating {accumulation_steps} steps)...")
         for epoch in range(request.num_epochs):
             model.train()
-            for i, (images, labels) in enumerate(train_loader):
-                images = images.to(device)
-                labels = labels.to(device)
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-                optimizer.zero_grad()
+            optimizer.zero_grad()
+            accumulated_loss = 0.0
+            for i, (image, label) in enumerate(train_loader):
+                image = image.to(device)
+                label = label.to(device)
+                output = model(image)
+                loss = criterion(output, label) / accumulation_steps
                 loss.backward()
+                accumulated_loss += loss.item()
+
+                if (i + 1) % accumulation_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    step_num = (i + 1) // accumulation_steps
+                    if step_num % 10 == 0:
+                        print(f"Epoch [{epoch+1}/{request.num_epochs}], Step [{step_num}], Loss: {accumulated_loss:.4f}")
+                    accumulated_loss = 0.0
+
+            # Flush any remaining accumulated gradients at end of epoch
+            if (i + 1) % accumulation_steps != 0:
                 optimizer.step()
-                if i % 10 == 0:
-                    print(f"Epoch [{epoch+1}/{request.num_epochs}], Batch [{i}/{len(train_loader)}], Loss: {loss.item():.4f}")
+                optimizer.zero_grad()
 
             model.eval()
             with torch.no_grad():
@@ -223,25 +248,42 @@ async def train_model(request: TrainRequest):
                     (model(imgs.to(device)).argmax(1) == lbls.to(device)).sum().item()
                     for imgs, lbls in val_loader
                 )
-            train_errors.append(1 - train_correct / len(train_subset))
-            val_errors.append(1 - val_correct / len(val_subset))
+            val_error = 1 - val_correct / len(val_subset)
+            all_train_errors[fold_num, epoch] = 1 - train_correct / len(train_subset)
+            all_val_errors[fold_num, epoch] = val_error
 
-        plt.figure()
-        plt.plot(range(1, request.num_epochs + 1), train_errors, label='Train Error')
-        plt.plot(range(1, request.num_epochs + 1), val_errors, label='Val Error')
-        plt.xlabel('Epoch')
-        plt.ylabel('Misclassification Error')
-        plt.title(f'Fold {fold_num + 1} - Learning Curve')
-        plt.legend()
-        plot_path = os.path.join(MODELS_DIR, f"{request.model_name}_fold{fold_num + 1}_curve.png")
-        plt.savefig(plot_path)
-        plt.close()
-        print(f"Saved learning curve to {plot_path}")
+            # Track best model across all folds and epochs
+            if val_error < best_val_error:
+                best_val_error = val_error
+                best_model_state = model.state_dict().copy()
+                best_fold = fold_num + 1
+                best_epoch = epoch + 1
+                print(f"New best model: Fold {best_fold}, Epoch {best_epoch}, Val Error: {best_val_error:.4f}")
 
-    # Save the model
+    # Average across folds
+    mean_train_errors = all_train_errors.mean(axis=0)
+    mean_val_errors = all_val_errors.mean(axis=0)
+
+    plt.figure()
+    plt.plot(range(1, request.num_epochs + 1), mean_train_errors, label='Avg Train Error')
+    plt.plot(range(1, request.num_epochs + 1), mean_val_errors, label='Avg Val Error')
+    plt.axvline(x=best_epoch, color='r', linestyle='--', alpha=0.7)
+    plt.scatter([best_epoch], [best_val_error], color='r', zorder=5,
+                label=f'Best Model (Fold {best_fold}, Epoch {best_epoch})')
+    plt.xlabel('Epoch')
+    plt.ylabel('Misclassification Error')
+    plt.title(f'{k}-Fold CV Learning Curve')
+    plt.legend()
+    plot_path = os.path.join(MODELS_DIR, f"{request.model_name}_cv_curve.png")
+    plt.savefig(plot_path)
+    plt.close()
+    print(f"Saved averaged learning curve to {plot_path}")
+    print(f"Best model from Fold {best_fold}, Epoch {best_epoch} with Val Error: {best_val_error:.4f}")
+
+    # Save the best model
     model_path = os.path.join(MODELS_DIR, f"{request.model_name}.pth")
     torch.save({
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': best_model_state,
         'classes': class_names
     }, model_path)
 
@@ -265,7 +307,7 @@ async def predict(model_name: str = Form(...), file: UploadFile = File(...)):
     try:
         # Prepare model
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-        model = CNN().to(device)
+        model = CNN_GMP().to(device)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
         class_names = checkpoint.get('classes', ["FAKE", "REAL"]) # fallback if older format
@@ -287,3 +329,36 @@ async def predict(model_name: str = Form(...), file: UploadFile = File(...)):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Fake vs Real Image Classifier")
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # Training Command Setup
+    train_parser = subparsers.add_parser("train", help="Train a new model")
+    train_parser.add_argument("--dataset", type=str, required=True, help="Dataset source name")
+    train_parser.add_argument("--name", type=str, required=True, help="Name to save the model as")
+    train_parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
+    train_parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
+
+    # Prediction Command Setup
+    predict_parser = subparsers.add_parser("predict", help="Predict an image")
+    predict_parser.add_argument("--name", type=str, required=True, help="Name of the trained model to use")
+    predict_parser.add_argument("--image", type=str, required=True, help="Path to the image file")
+
+    args = parser.parse_args()
+
+    if args.command == "train":
+        asyncio.run(train_model(TrainRequest(
+            dataset_source=args.dataset,
+            model_name=args.name,
+            num_epochs=args.epochs,
+            learning_rate=args.lr
+        )))
+    elif args.command == "predict":
+        with open(args.image, "rb") as f:
+            upload = UploadFile(filename=os.path.basename(args.image), file=io.BytesIO(f.read()))
+        result = asyncio.run(predict(model_name=args.name, file=upload))
+        print(result)
+    else:
+        parser.print_help()
