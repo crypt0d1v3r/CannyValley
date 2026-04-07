@@ -112,6 +112,25 @@ data_transforms = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
+class HuggingFaceImageDataset(torch.utils.data.Dataset):
+    """Wraps a HuggingFace dataset split for use with PyTorch DataLoader."""
+    def __init__(self, hf_split, transform=None):
+        self.hf_split = hf_split
+        self.transform = transform
+        self.classes = hf_split.features['label'].names
+
+    def __len__(self):
+        return len(self.hf_split)
+
+    def __getitem__(self, idx):
+        item = self.hf_split[idx]
+        image = item['image'].convert('RGB')
+        label = item['label']
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+
 def kfold_split(data, k=5):
     """Creates k-fold cross-validation splits for the given data.
     
@@ -137,7 +156,7 @@ def kfold_split(data, k=5):
 class TrainRequest(BaseModel):
     dataset_source: str
     model_name: str
-    num_epochs: int = 50
+    num_epochs: int = 20
     learning_rate: float = 0.001
 
 @app.get("/datasets")
@@ -161,35 +180,32 @@ async def train_model(request: TrainRequest):
         raise HTTPException(status_code=400, detail="Invalid dataset source. Check /datasets for valid options.")
 
     # 1. Dataset Loading Logic
-    dataset_path = DATASETS_DIR
     try:
         if request.dataset_source == "birdy654/cifake-real-and-ai-generated-synthetic-images":
             dataset_path = kagglehub.dataset_download("birdy654/cifake-real-and-ai-generated-synthetic-images")
+            train_dir = os.path.join(dataset_path, 'train')
+            test_dir = os.path.join(dataset_path, 'test')
+            if not os.path.exists(train_dir) or not os.path.exists(test_dir):
+                raise HTTPException(status_code=500, detail=f"Dataset directories not found at {dataset_path}")
+            train_dataset = vision_datasets.ImageFolder(root=train_dir, transform=data_transforms)
+            class_names = train_dataset.classes
         elif request.dataset_source == "Hemg/AI-vs-Real-images":
-            dataset_path = load_dataset("Hemg/AI-vs-Real-images")
-            raise HTTPException(status_code=501, detail="HuggingFace dataset custom export mapping not supported yet.")
+            hf_data = load_dataset("Hemg/AI-vs-Real-images")
+            train_dataset = HuggingFaceImageDataset(hf_data['train'], transform=data_transforms)
+            class_names = train_dataset.classes
         elif request.dataset_source == "bitmind/AI-vs-Real-Dataset-Images-Proper":
-            dataset_path = load_dataset("bitmind/AI-vs-Real-Dataset-Images-Proper")
-            raise HTTPException(status_code=501, detail="HuggingFace dataset custom export mapping not supported yet.")
+            hf_data = load_dataset("bitmind/AI-vs-Real-Dataset-Images-Proper")
+            train_dataset = HuggingFaceImageDataset(hf_data['train'], transform=data_transforms)
+            class_names = train_dataset.classes
         else:
-             raise HTTPException(status_code=400, detail=f"Dataset Source {request.dataset_source} Unknown")
+            raise HTTPException(status_code=400, detail=f"Dataset Source {request.dataset_source} Unknown")
     except HTTPException:
         raise
     except Exception as e:
-         raise HTTPException(status_code=500, detail=f"Failed to load dataset: {str(e)}")
-
-    train_dir = os.path.join(dataset_path, 'train')
-    
-    test_dir = os.path.join(dataset_path , 'test')
-    
-    if not os.path.exists(train_dir) or not os.path.exists(test_dir):
-        raise HTTPException(status_code=500, detail=f"Dataset directories not found at {dataset_path}")
-
-    train_dataset = vision_datasets.ImageFolder(root=train_dir, transform=data_transforms)
-    class_names = train_dataset.classes
+        raise HTTPException(status_code=500, detail=f"Failed to load dataset: {str(e)}")
     
     # 2. Model & Training Configuration
-    k = 5
+    k = 3
     criterion = torch.nn.CrossEntropyLoss()
     weight_decay = 0.01
     accumulation_steps = 32
@@ -204,6 +220,10 @@ async def train_model(request: TrainRequest):
 
     for fold_num, (train_subset, val_subset) in enumerate(kfold_split(train_dataset, k=k)):
         print(f"\n--- Fold {fold_num + 1}/{k} ---")
+        
+        # Free previous fold's GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Reinitialize model and optimizer for each fold
         model = CNN_GMP().to(device)
