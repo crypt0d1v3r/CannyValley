@@ -108,6 +108,7 @@ class CNN_GMP(nn.Module):
 data_transforms = transforms.Compose([
     # REMOVED: transforms.Resize(256)
     # REMOVED: transforms.CenterCrop(224)
+    transforms.RandomCrop(800, pad_if_needed=True, padding_mode='constant'),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
@@ -237,6 +238,7 @@ async def train_model(request: TrainRequest):
             model.train()
             optimizer.zero_grad()
             accumulated_loss = 0.0
+            train_correct = 0
             for i, (image, label) in enumerate(train_loader):
                 image = image.to(device)
                 label = label.to(device)
@@ -244,6 +246,7 @@ async def train_model(request: TrainRequest):
                 loss = criterion(output, label) / accumulation_steps
                 loss.backward()
                 accumulated_loss += loss.item()
+                train_correct += (output.argmax(1) == label).sum().item()
 
                 if (i + 1) % accumulation_steps == 0:
                     optimizer.step()
@@ -260,10 +263,6 @@ async def train_model(request: TrainRequest):
 
             model.eval()
             with torch.no_grad():
-                train_correct = sum(
-                    (model(imgs.to(device)).argmax(1) == lbls.to(device)).sum().item()
-                    for imgs, lbls in train_loader
-                )
                 val_correct = sum(
                     (model(imgs.to(device)).argmax(1) == lbls.to(device)).sum().item()
                     for imgs, lbls in val_loader
