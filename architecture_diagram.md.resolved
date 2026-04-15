@@ -1,0 +1,184 @@
+# CannyValley — System Architecture
+
+> **CannyValley** is an AI-vs-Real image classification system built with PyTorch. It trains a Convolutional Neural Network (CNN) to distinguish between AI-generated and real images using the CIFAKE dataset.
+
+---
+
+## High-Level Pipeline
+
+```mermaid
+flowchart LR
+    subgraph DataSources["🌐 Data Sources"]
+        KG["Kaggle Hub\n(birdy654/cifake)"]
+        HF1["HuggingFace\n(Hemg/AI-vs-Real-images)"]
+        HF2["HuggingFace\n(bitmind/AI-vs-Real-Dataset)"]
+    end
+
+    subgraph Ingestion["📥 Data Ingestion"]
+        DL["Dataset Downloader\n(kagglehub / datasets lib)"]
+    end
+
+    subgraph Preprocessing["🔧 Preprocessing"]
+        TX["Transforms Pipeline"]
+        IF["ImageFolder Loader"]
+        DLR["DataLoader\n(batch=32)"]
+    end
+
+    subgraph Model["🧠 CNN Model"]
+        CONV["Conv Layers\n(3 blocks)"]
+        FC["Fully Connected\n(Dense Layers)"]
+    end
+
+    subgraph Training["🏋️ Training Loop"]
+        OPT["Adam Optimizer\n(lr=0.001, wd=0.01)"]
+        LOSS["CrossEntropy Loss"]
+        EP["Epoch Iterator\n(50 epochs)"]
+    end
+
+    subgraph Evaluation["📊 Evaluation"]
+        ACC["Accuracy Calculator"]
+        VIZ["Visualization\n(matplotlib)"]
+    end
+
+    KG --> DL
+    HF1 -.->|alternative| DL
+    HF2 -.->|alternative| DL
+    DL --> TX
+    TX --> IF
+    IF --> DLR
+    DLR --> EP
+    EP --> CONV
+    CONV --> FC
+    FC --> LOSS
+    LOSS --> OPT
+    OPT -->|update weights| CONV
+    DLR -->|test set| ACC
+    ACC --> VIZ
+    EP -->|loss curve| VIZ
+```
+
+---
+
+## CNN Architecture Detail
+
+```mermaid
+flowchart TB
+    INPUT["Input Image\n3 × 224 × 224"] --> C1
+
+    subgraph Block1["Conv Block 1"]
+        C1["Conv2d\n3 → 32, 3×3, pad=1"]
+        R1["ReLU"]
+        P1["MaxPool2d\n2×2"]
+        C1 --> R1 --> P1
+    end
+
+    P1 --> C2
+
+    subgraph Block2["Conv Block 2"]
+        C2["Conv2d\n32 → 64, 3×3, pad=1"]
+        R2["ReLU"]
+        P2["MaxPool2d\n2×2"]
+        C2 --> R2 --> P2
+    end
+
+    P2 --> C3
+
+    subgraph Block3["Conv Block 3"]
+        C3["Conv2d\n64 → 64, 3×3, pad=1"]
+        R3["ReLU"]
+        P3["MaxPool2d\n2×2"]
+        C3 --> R3 --> P3
+    end
+
+    P3 --> FL["Flatten\n64 × 28 × 28 = 50,176"]
+    FL --> FC1["Linear\n50,176 → 512"]
+    FC1 --> R4["ReLU"]
+    R4 --> FC2["Linear\n512 → 2"]
+    FC2 --> OUT["Output\n(REAL / FAKE)"]
+```
+
+---
+
+## Data Preprocessing Pipeline
+
+```mermaid
+flowchart LR
+    RAW["Raw Image\n(variable size)"] --> RS["Resize\nto 256px"]
+    RS --> CC["CenterCrop\n224 × 224"]
+    CC --> TT["ToTensor\n(0–1 float)"]
+    TT --> NM["Normalize\nμ=[.485,.456,.406]\nσ=[.229,.224,.225]"]
+    NM --> READY["Preprocessed Tensor\n3 × 224 × 224"]
+```
+
+---
+
+## Training & Evaluation Flow
+
+```mermaid
+flowchart TB
+    subgraph TrainPhase["Training Phase"]
+        direction TB
+        TE["For each epoch (1..50)"]
+        TB["For each batch in train_loader"]
+        FW["Forward Pass → outputs"]
+        CL["Compute CrossEntropyLoss"]
+        BP["Backward Pass (loss.backward)"]
+        US["Optimizer Step (Adam)"]
+        TL["Accumulate train_loss"]
+        TE --> TB --> FW --> CL --> BP --> US --> TL
+        TL -->|next batch| TB
+        TL -->|epoch done| TE
+    end
+
+    subgraph EvalPhase["Evaluation Phase"]
+        direction TB
+        EM["model.eval() + no_grad"]
+        EB["For each batch in test_loader"]
+        EF["Forward Pass → outputs"]
+        EP["argmax → predictions"]
+        EA["Accumulate correct predictions"]
+        EM --> EB --> EF --> EP --> EA
+        EA -->|next batch| EB
+    end
+
+    subgraph Output["Output & Visualization"]
+        LC["Training Loss Curve\n(matplotlib)"]
+        AS["Test Accuracy Score"]
+        SG["Sample Grid\n(actual vs predicted)"]
+    end
+
+    TrainPhase --> EvalPhase
+    TrainPhase --> LC
+    EvalPhase --> AS
+    EvalPhase --> SG
+```
+
+---
+
+## Component Summary
+
+| Component | Technology | Purpose |
+|---|---|---|
+| **Data Sourcing** | `kagglehub`, `datasets` (HuggingFace) | Download CIFAKE or alternative datasets |
+| **Preprocessing** | `torchvision.transforms` | Resize, crop, normalize images to 224×224 tensors |
+| **Data Loading** | `torchvision.datasets.ImageFolder`, `torch.utils.data.DataLoader` | Batch images with labels (REAL=0, FAKE=1) |
+| **Model** | `torch.nn.Module` (custom CNN) | 3 conv blocks → flatten → 2 FC layers → binary output |
+| **Loss Function** | `torch.nn.CrossEntropyLoss` | Multi-class cross-entropy for binary classification |
+| **Optimizer** | `torch.optim.Adam` | Adaptive learning rate (lr=0.001, weight_decay=0.01) |
+| **Evaluation** | PyTorch inference loop | Calculate test accuracy via argmax comparison |
+| **Visualization** | `matplotlib` | Plot loss curve and sample prediction grid |
+| **Environment** | Google Colab / Jupyter (Anaconda) | Interactive notebook execution with optional GPU |
+
+---
+
+## Key Hyperparameters
+
+| Parameter | Value |
+|---|---|
+| Batch Size | 32 |
+| Epochs | 50 |
+| Learning Rate | 0.001 |
+| Weight Decay | 0.01 |
+| Image Size | 224 × 224 |
+| Normalization | ImageNet mean/std |
+| Output Classes | 2 (REAL, FAKE) |

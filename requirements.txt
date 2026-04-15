@@ -1,6 +1,8 @@
 # Data and Dataset Management
 kagglehub
-datasetsfastapi
+datasets
+fastapi
 uvicorn
 python-multipart
 Pillow
+tqdm
