@@ -1,0 +1,2 @@
+time python -u main.py train --dataset datasets/bitmind_AI-vs-Real-Dataset-Images-Proper_filtered --name gap-epoch50-256filter --model-type gap --epochs 50 --lr 0.001 |& tee gap-epoch50-256filter.log
+
