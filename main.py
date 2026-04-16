@@ -10,7 +10,7 @@ from pydantic import BaseModel
 import kagglehub
 from datasets import load_dataset
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, ConcatDataset
 import torchvision.datasets as vision_datasets
 import torch
 import torch.nn as nn
@@ -319,7 +319,7 @@ def kfold_split(data, k=5):
 
 
 class TrainRequest(BaseModel):
-    dataset_source: str
+    dataset_source: list[str]
     model_name: str
     model_type: str = "gap"
     num_epochs: int = 20
@@ -343,9 +343,11 @@ async def get_models():
 @app.post("/train")
 async def train_model(request: TrainRequest):
     """Downloads dataset, trains model, and saves weights locally."""
-    is_local = os.path.isdir(request.dataset_source)
-    if not is_local and request.dataset_source not in AVAILABLE_DATASETS:
-        raise HTTPException(status_code=400, detail="Invalid dataset source. Provide a local ImageFolder path or check /datasets for valid options.")
+    # Validate all dataset sources
+    for src in request.dataset_source:
+        is_local = os.path.isdir(src)
+        if not is_local and src not in AVAILABLE_DATASETS:
+            raise HTTPException(status_code=400, detail=f"Invalid dataset source: {src}. Provide a local ImageFolder path or check /datasets for valid options.")
     if request.model_type not in AVAILABLE_MODELS:
         raise HTTPException(status_code=400, detail=f"Invalid model_type. Choose from: {AVAILABLE_MODELS}")
 
@@ -361,38 +363,51 @@ async def train_model(request: TrainRequest):
         batch_size = 32
         accumulation_steps = 1
 
-    # 1. Dataset Loading Logic
-    print(f"[1/4] Loading dataset: {request.dataset_source} ...", flush=True)
+    # 1. Dataset Loading Logic — load each source and concatenate
+    print(f"[1/4] Loading {len(request.dataset_source)} dataset(s) ...", flush=True)
+    datasets_list = []
+    class_names = None
     try:
-        if is_local:
-            # Local ImageFolder directory — look for a train/ subfolder, fall back to root
-            train_dir = os.path.join(request.dataset_source, 'train')
-            if not os.path.isdir(train_dir):
-                train_dir = request.dataset_source
-            train_dataset = vision_datasets.ImageFolder(root=train_dir, transform=active_transforms)
-            class_names = train_dataset.classes
-        elif request.dataset_source == "birdy654/cifake-real-and-ai-generated-synthetic-images":
-            dataset_path = kagglehub.dataset_download("birdy654/cifake-real-and-ai-generated-synthetic-images")
-            train_dir = os.path.join(dataset_path, 'train')
-            test_dir = os.path.join(dataset_path, 'test')
-            if not os.path.exists(train_dir) or not os.path.exists(test_dir):
-                raise HTTPException(status_code=500, detail=f"Dataset directories not found at {dataset_path}")
-            train_dataset = vision_datasets.ImageFolder(root=train_dir, transform=active_transforms)
-            class_names = train_dataset.classes
-        elif request.dataset_source == "Hemg/AI-vs-Real-images":
-            hf_data = load_dataset("Hemg/AI-vs-Real-images")
-            train_dataset = HuggingFaceImageDataset(hf_data['train'], transform=active_transforms)
-            class_names = train_dataset.classes
-        elif request.dataset_source == "bitmind/AI-vs-Real-Dataset-Images-Proper":
-            hf_data = load_dataset("bitmind/AI-vs-Real-Dataset-Images-Proper")
-            train_dataset = HuggingFaceImageDataset(hf_data['train'], transform=active_transforms)
-            class_names = train_dataset.classes
-        elif request.dataset_source == "Parveshiiii/AI-vs-Real":
-            hf_data = load_dataset("Parveshiiii/AI-vs-Real", verification_mode="no_checks")
-            train_dataset = HuggingFaceImageDataset(hf_data['train'], transform=active_transforms)
-            class_names = train_dataset.classes
+        for src in request.dataset_source:
+            is_local = os.path.isdir(src)
+            if is_local:
+                train_dir = os.path.join(src, 'train')
+                if not os.path.isdir(train_dir):
+                    train_dir = src
+                ds = vision_datasets.ImageFolder(root=train_dir, transform=active_transforms)
+                src_classes = ds.classes
+            elif src == "birdy654/cifake-real-and-ai-generated-synthetic-images":
+                dataset_path = kagglehub.dataset_download("birdy654/cifake-real-and-ai-generated-synthetic-images")
+                train_dir = os.path.join(dataset_path, 'train')
+                test_dir = os.path.join(dataset_path, 'test')
+                if not os.path.exists(train_dir) or not os.path.exists(test_dir):
+                    raise HTTPException(status_code=500, detail=f"Dataset directories not found at {dataset_path}")
+                ds = vision_datasets.ImageFolder(root=train_dir, transform=active_transforms)
+                src_classes = ds.classes
+            elif src == "Hemg/AI-vs-Real-images":
+                hf_data = load_dataset("Hemg/AI-vs-Real-images")
+                ds = HuggingFaceImageDataset(hf_data['train'], transform=active_transforms)
+                src_classes = ds.classes
+            elif src == "bitmind/AI-vs-Real-Dataset-Images-Proper":
+                hf_data = load_dataset("bitmind/AI-vs-Real-Dataset-Images-Proper")
+                ds = HuggingFaceImageDataset(hf_data['train'], transform=active_transforms)
+                src_classes = ds.classes
+            elif src == "Parveshiiii/AI-vs-Real":
+                hf_data = load_dataset("Parveshiiii/AI-vs-Real", verification_mode="no_checks")
+                ds = HuggingFaceImageDataset(hf_data['train'], transform=active_transforms)
+                src_classes = ds.classes
+            else:
+                raise HTTPException(status_code=400, detail=f"Dataset Source {src} Unknown")
+
+            print(f"  - {src}: {len(ds):,} images, classes: {src_classes}", flush=True)
+            if class_names is None:
+                class_names = src_classes
+            datasets_list.append(ds)
+
+        if len(datasets_list) == 1:
+            train_dataset = datasets_list[0]
         else:
-            raise HTTPException(status_code=400, detail=f"Dataset Source {request.dataset_source} Unknown")
+            train_dataset = ConcatDataset(datasets_list)
     except HTTPException:
         raise
     except Exception as e:
@@ -614,7 +629,7 @@ if __name__ == "__main__":
 
     # Training Command Setup
     train_parser = subparsers.add_parser("train", help="Train a new model")
-    train_parser.add_argument("--dataset", type=str, required=True, help="Dataset source name")
+    train_parser.add_argument("--dataset", type=str, nargs='+', required=True, help="One or more dataset sources (local paths or HuggingFace IDs)")
     train_parser.add_argument("--name", type=str, required=True, help="Name to save the model as")
     train_parser.add_argument("--model-type", type=str, default="gap", choices=AVAILABLE_MODELS, help="Model architecture to use")
     train_parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
