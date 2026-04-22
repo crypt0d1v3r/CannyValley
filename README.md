@@ -101,6 +101,3 @@ python main.py predict \
 - Ensure all dependencies are installed and the correct Python environment is active.
 - For HuggingFace datasets, you may need to be logged in with `huggingface-cli login`.
 - For Kaggle datasets, ensure you have Kaggle API credentials set up.
-
-## License
-See `LICENSE` file if present.
